@@ -1,3 +1,4 @@
+
 # General surgery vision transformer (GSViT)
 Code repository for paper: "General surgery vision transformer: A video pre-trained foundation model for general surgery"
 
@@ -20,3 +21,7 @@ Please cite the following:
   year={2024}
 }
 ```
+=======
+# GSVIT_test
+Combined changes from both versions
+
