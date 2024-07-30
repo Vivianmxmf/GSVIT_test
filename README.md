@@ -20,8 +20,7 @@ Please cite the following:
   journal={arXiv preprint arXiv:2403.05949},
   year={2024}
 }
-```
-=======
+
 # GSVIT_test
 Combined changes from both versions
 
