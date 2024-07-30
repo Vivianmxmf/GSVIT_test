@@ -9,7 +9,7 @@ from torch.nn.parallel import DataParallel
 from torchvision.transforms import ToPILImage
 from EfficientViT.classification.model.build import EfficientViT_M5
 
-
+## SEAttention to reconstruct video frames from the latent space.
 class SEAttention(nn.Module):
     def __init__(self, in_channels, reduction=16):
         super(SEAttention, self).__init__()
@@ -27,7 +27,7 @@ class SEAttention(nn.Module):
         y = self.fc(y).view(b, c, 1, 1)
         return x * y
 
-
+## Decoders
 class Decoder(nn.Module):
     def __init__(self, in_size, predict_change=False):
         super(Decoder, self).__init__()
@@ -89,7 +89,9 @@ class Decoder(nn.Module):
             self.tanh = nn.Tanh()
 
     def forward(self, x):
-        x = self.fc(x.reshape(self.in_size, 384*4*4))
+        #print(f"Shape before reshape: {x.shape}")
+        x = self.fc(x.reshape(x.size(0), -1)) 
+        
         x = self.bn1d(x)
         x = self.gelu(x)
         x = x.view(-1, 1024, 7, 7)
@@ -106,10 +108,10 @@ class Decoder(nn.Module):
             x = self.tanh(x)
         return x
 
-
+## Encoders
 class EfficientViTAutoEncoder(nn.Module):
     def __init__(self, in_size, predict_change=False):
-        super(EfficientViTAutoEncoder, self).__init__()
+        super(EfficientViTAutoEncoder, self).__init__() ##Initializes EfficientViT with pretrained weights
         self.predict_change = predict_change
         self.decoder = Decoder(in_size, predict_change)
         self.evit = EfficientViT_M5(pretrained='efficientvit_m5')
@@ -117,17 +119,20 @@ class EfficientViTAutoEncoder(nn.Module):
         self.evit = torch.nn.Sequential(*list(self.evit.children())[:-1])
 
     def forward(self, x):
+        b, t, c, h, w = x.size()
+        assert h == 224 and w == 224,  f"Expected input height and width to be 224, but got {h} and {w}" 
+        x = x.view(b * t, c, h, w)  # Combine batch and time dimensions
         out = self.evit(x)
-        decoded = self.decoder.forward(out)
+        out = out.view(b, t, -1)  # Split batch and time dimensions
+        decoded = self.decoder(out)
         return decoded
-
 
 
 if __name__ == "__main__":
     # linear schedule
     epochs = 5
     in_size = 100
-    batch_size = 100
+    batch_size = 80
     data_processed = 0
     num_data = 70000000//2
     itrs_per_epoch = num_data//batch_size
@@ -138,7 +143,7 @@ if __name__ == "__main__":
     lr = lr_start
     step = (lr_start - lr_finish)/(itrs_per_epoch*epochs)
 
-    gpu_parallel = False
+    gpu_parallel = True
     data_parallel = True
     custom_dataset = True
     predict_change = False
@@ -152,9 +157,10 @@ if __name__ == "__main__":
     evitae = EfficientViTAutoEncoder(in_size, predict_change=predict_change)
     if gpu_parallel and torch.cuda.device_count() > 1:
         print("Using", torch.cuda.device_count(), "GPU(s)")
-        evitae = nn.DataParallel(evitae)
-    device = torch.device("cuda:3" if torch.cuda.is_available() else "cpu")
+        evitae = nn.DataParallel(evitae, device_ids=[0, 1, 2, 3, 4, 5, 6, 7])
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     evitae.to(device)
+    print(f"Running on device: {device}")
 
 
     running_loss = 0
@@ -164,37 +170,33 @@ if __name__ == "__main__":
 
     evitae.train()
     if custom_dataset:
-        from dataloader_surgical import load_data
-        dataset = load_data(
-            num_images=batch_size, 
-            data_root="../surgical_simvp/data/", 
-            num_workers=1,
-            predict_change=predict_change,)
-        dataset.parallel_generate()
+        from dataloader_surgical import load_data, read_video
+        data_root = "Training_video"
+        dataloader_train = load_data(root=data_root, batch_size=batch_size, is_train=True, num_workers=4, pin_memory=True,target_size=(224, 224))
     else:
         images = torch.rand(1, 3, 224, 224).repeat(in_size*num_devices, 1, 1, 1)
         images = images.to(device=device)
 
     for _epoch_itr in range(epochs):
         for _itr in range(itrs_per_epoch):
+            torch.cuda.empty_cache()
             itr_start = time.time()
             reconstruct_loss = 0
             # generate minibatch indices
             minibatches = torch.arange(batch_size)
             idx = torch.randperm(minibatches.shape[0])
-            minibatches = minibatches[idx].view(minibatches.size())
+            minibatches = idx.view(minibatches.size())
             minibatches = list(torch.split(minibatches, in_size))
             # iterate through minibatch indices
             for mb_ind in range(len(minibatches)):
                 data_processed += in_size
                 if custom_dataset:
-                    images, targets = dataset.get(minibatches[mb_ind])
-                    if gpu_parallel:
-                        images = images.to(device)
-                        targets = targets.to(device)
+                    inputs, targets = next(iter(dataloader_train))
+                    inputs = inputs.to(device)
+                    targets = targets.to(device)
                 else:
                     target = images
-                decoded = evitae(images)
+                decoded = evitae(inputs)
                 _sub_rcloss = abs(decoded.flatten() - targets.detach().flatten()).mean()
                 reconstruct_loss += _sub_rcloss
 
@@ -207,7 +209,7 @@ if __name__ == "__main__":
 
             optim.zero_grad()
             t = time.time()
-            dataset.generate_dataset(parallel_call=True)
+            #dataset.generate_dataset(parallel_call=True)
 
             filter_res = 0.99
             filter_run_long = 0.997
@@ -232,18 +234,32 @@ if __name__ == "__main__":
                     "\nEst Time Per Epoch:", epoch_est_filter,
                     "\nEst Time Left in Epoch:", (1-round(_itr/itrs_per_epoch, 5))*epoch_est_filter,
                     "\nLoss: {}, Running Loss: {}:".format(round(float(running_loss), 5), round(float(running_loss_lg), 5)),)
-            
+            import os
+            save_dir = "evit_train2"
+            if not os.path.exists(save_dir):
+                os.makedirs(save_dir)
+            # saves the model state every 1000 iterations
             if (_itr+1) % 1000 == 0:
                 #with open("evit_save/saved_network{}_{}.pkl".format(_epoch_itr, _itr//1000), "wb") as f:
                 #    pickle.dump(evitae.state_dict(), f)
-                torch.save(evitae.state_dict(), "evit_train2/saved_network{}_{}.pkl".format(_epoch_itr, _itr//1000))
+                torch.save(evitae.state_dict(), os.path.join(save_dir, "saved_network{}_{}.pkl".format(_epoch_itr, _itr//1000))) 
+            # Every 50 iterations, saves the first input image and its decoded output as a combined image 
             if (_itr+1) % 50 == 0:
-                first_image = images[0].cpu()
+                first_image = inputs[0].cpu()
                 #first_image = cv2.cvtColor(first_image, cv2.COLOR_BGR2RGB)
                 first_decoded = decoded[0].cpu()
                 #first_decoded = cv2.cvtColor(decoded[0].cpu(), cv2.COLOR_BGR2RGB)
+                if first_image.dim() == 3:
+                    first_image = first_image.unsqueeze(0)
+                if first_decoded.dim() == 3:
+                    first_decoded = first_decoded.unsqueeze(0)
+                
+                
                 first_tensor = torch.cat((first_image, first_decoded), dim=2)
                 first_tensor = first_tensor / first_tensor.max()
+
+                first_tensor = first_tensor[0]
+
                 to_pil = ToPILImage()
                 image = to_pil(first_tensor)
                 image.save('output_image.png')
